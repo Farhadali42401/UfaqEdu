@@ -1,0 +1,131 @@
+name: Daily Database Backup
+
+on:
+  schedule:
+    - cron: '0 12 * * *' # Every day at 12:00 PM UTC (5:00 PM PKT)
+  workflow_dispatch: # Allows manual trigger from GitHub Actions UI
+
+jobs:
+  backup:
+    name: Backup Supabase PostgreSQL Database
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Prepare pg_dump client
+        run: |
+          docker pull postgres:17-alpine
+
+      - name: Run pg_dump
+        env:
+          SUPABASE_BACKUP_DATABASE_URL: ${{ secrets.SUPABASE_BACKUP_DATABASE_URL }}
+          SUPABASE_DB_HOST: ${{ secrets.SUPABASE_DB_HOST }}
+          SUPABASE_POOLER_HOST: ${{ secrets.SUPABASE_POOLER_HOST }}
+          SUPABASE_POOLER_PORT: ${{ secrets.SUPABASE_POOLER_PORT }}
+          PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+          FILENAME="ufaqedu_backup_${TIMESTAMP}.sql"
+          CONNECTION_FAILED=true
+
+          dump_with_conn() {
+            local label="$1"
+            local conn="$2"
+
+            echo "Attempting backup via ${label}..."
+            if docker run --rm \
+              -e PGPASSWORD="$PGPASSWORD" \
+              postgres:17-alpine \
+              pg_dump "$conn" \
+                --no-password \
+                --format=plain \
+                --clean \
+                --if-exists \
+                --quote-all-identifiers \
+              > "${FILENAME}"; then
+              CONNECTION_FAILED=false
+              echo "Backup connection successful via ${label}."
+              return 0
+            fi
+
+            echo "Backup connection failed via ${label}."
+            return 1
+          }
+
+          get_ipv4() {
+            local host="$1"
+            getent ahostsv4 "$host" | awk 'NR==1 {print $1}'
+          }
+
+          # Preferred path: use a dedicated backup connection URL secret.
+          # This allows using Supabase pooler/session-mode URLs that are IPv4 reachable from GitHub Actions.
+          if [ -n "${SUPABASE_BACKUP_DATABASE_URL:-}" ]; then
+            dump_with_conn "backup URL secret" "$SUPABASE_BACKUP_DATABASE_URL" || true
+          fi
+
+          if [ "$CONNECTION_FAILED" = false ]; then
+            echo "BACKUP_FILE=${FILENAME}" >> $GITHUB_ENV
+            echo "Backup created: ${FILENAME} ($(du -sh ${FILENAME} | cut -f1))"
+            exit 0
+          fi
+
+          if [ -z "${SUPABASE_BACKUP_DATABASE_URL:-}" ] && [ -z "${SUPABASE_DB_HOST:-}" ] && [ -z "${SUPABASE_POOLER_HOST:-}" ]; then
+            echo "No usable backup connection found."
+            echo "Set SUPABASE_BACKUP_DATABASE_URL (recommended), or SUPABASE_DB_HOST plus SUPABASE_DB_PASSWORD."
+            echo "For GitHub Actions, use an IPv4-capable Supabase connection URL in SUPABASE_BACKUP_DATABASE_URL."
+            exit 1
+          fi
+
+          if [ -n "${SUPABASE_DB_HOST:-}" ]; then
+            PRIMARY_IPV4="$(get_ipv4 "$SUPABASE_DB_HOST" || true)"
+            if [ -n "$PRIMARY_IPV4" ]; then
+              PRIMARY_CONN="host=${SUPABASE_DB_HOST} hostaddr=${PRIMARY_IPV4} port=5432 user=postgres dbname=postgres sslmode=require password=${PGPASSWORD}"
+              echo "Resolved IPv4 for primary host."
+            else
+              PRIMARY_CONN="host=${SUPABASE_DB_HOST} port=5432 user=postgres dbname=postgres sslmode=require password=${PGPASSWORD}"
+              echo "No IPv4 record resolved for primary host; trying default DNS resolution."
+            fi
+
+            dump_with_conn "primary host" "$PRIMARY_CONN" || true
+          fi
+
+          if [ "$CONNECTION_FAILED" = true ] && [ -n "${SUPABASE_POOLER_HOST:-}" ]; then
+            POOLER_PORT="${SUPABASE_POOLER_PORT:-6543}"
+            POOLER_IPV4="$(get_ipv4 "$SUPABASE_POOLER_HOST" || true)"
+
+            if [ -n "$POOLER_IPV4" ]; then
+              POOLER_CONN="host=${SUPABASE_POOLER_HOST} hostaddr=${POOLER_IPV4} port=${POOLER_PORT} user=postgres dbname=postgres sslmode=require password=${PGPASSWORD}"
+              echo "Resolved IPv4 for pooler host."
+            else
+              POOLER_CONN="host=${SUPABASE_POOLER_HOST} port=${POOLER_PORT} user=postgres dbname=postgres sslmode=require password=${PGPASSWORD}"
+              echo "No IPv4 record resolved for pooler host; trying default DNS resolution."
+            fi
+
+            dump_with_conn "pooler host" "$POOLER_CONN" || true
+          fi
+
+          if [ "$CONNECTION_FAILED" = true ]; then
+            echo "All connection attempts failed. Check SUPABASE_DB_HOST and optional SUPABASE_POOLER_HOST secrets."
+            echo "Recommendation: set SUPABASE_BACKUP_DATABASE_URL to Supabase's IPv4/session pooler URI and rerun."
+            exit 1
+          fi
+
+          echo "BACKUP_FILE=${FILENAME}" >> $GITHUB_ENV
+          echo "Backup created: ${FILENAME} ($(du -sh ${FILENAME} | cut -f1))"
+
+      - name: Upload backup as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: db-backup-${{ github.run_number }}
+          path: ${{ env.BACKUP_FILE }}
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Backup summary
+        run: |
+          echo "✅ Backup completed successfully"
+          echo "File: ${{ env.BACKUP_FILE }}"
+          echo "Artifact retained for 90 days"
+          echo "Download from: GitHub → Actions → This workflow run → Artifacts"
