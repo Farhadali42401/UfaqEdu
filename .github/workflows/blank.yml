@@ -10,6 +10,10 @@ jobs:
     name: Backup Supabase PostgreSQL Database
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    
+    # Required permission for the keep-alive action to push an empty commit
+    permissions:
+      contents: write 
 
     steps:
       - name: Prepare pg_dump client
@@ -39,11 +43,11 @@ jobs:
               -e PGPASSWORD="$PGPASSWORD" \
               postgres:17-alpine \
               pg_dump "$conn" \
-                --no-password \
-                --format=plain \
-                --clean \
-                --if-exists \
-                --quote-all-identifiers \
+              --no-password \
+              --format=plain \
+              --clean \
+              --if-exists \
+              --quote-all-identifiers \
               > "${FILENAME}"; then
               CONNECTION_FAILED=false
               echo "Backup connection successful via ${label}."
@@ -129,3 +133,9 @@ jobs:
           echo "File: ${{ env.BACKUP_FILE }}"
           echo "Artifact retained for 90 days"
           echo "Download from: GitHub → Actions → This workflow run → Artifacts"
+
+      - name: Keep GitHub Actions alive
+        uses: gautamkrishnar/keepalive-workflow@v2
+        with:
+          # Runs even if previous steps failed so your schedule doesn't die during a broken streak
+          use_api: false
